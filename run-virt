@@ -24,7 +24,6 @@ import logging
 
 LVM_POOL_NAME="lvm_virt_pool"
 
-ISO_PATH="--disk=path=%s,device=cdrom,shareable=on,readonly=on"
 OVMF_DIR="/usr/share/edk2.git/ovmf-x64/"
 UEFI_FIRMWARE="loader=%(OMVF)s/OVMF-pure-efi.fd,loader_ro=yes,loader_type=pflash,nvram_template=%(OMVF)s/OVMF_VARS-pure-efi.fd" % {"OMVF": OVMF_DIR}
 
