@@ -1,0 +1,115 @@
+#!/usr/bin/python3
+#
+# Copyright (C) 2015
+# Red Hat, Inc.  All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Authors:      Brian C. Lane <bcl@redhat.com>
+#
+import subprocess
+import argparse
+import logging
+
+LVM_POOL_NAME="lvm_virt_pool"
+
+ISO_PATH="--disk=path=%s,device=cdrom,shareable=on,readonly=on"
+OVMF_DIR="/usr/share/edk2.git/ovmf-x64/"
+UEFI_FIRMWARE="loader=%(OMVF)s/OVMF-pure-efi.fd,loader_ro=yes,loader_type=pflash,nvram_template=%(OMVF)s/OVMF_VARS-pure-efi.fd" % {"OMVF": OVMF_DIR}
+
+
+def main(args):
+    # Shut down any previous virt
+    try:
+        subprocess.check_call(["virsh", "destroy", args.name])
+    except subprocess.CalledProcessError:
+        pass
+    try:
+        subprocess.check_call(["virsh", "undefine", args.name])
+    except subprocess.CalledProcessError:
+        pass
+
+    disks = []
+    for n in range(0,args.disks):
+        if n:
+            name = args.name + "-%d" % n
+        else:
+            name = args.name
+
+        if args.blank:
+            cmd = ["virsh", "vol-delete", "--pool", LVM_POOL_NAME, name]
+            logging.debug(cmd)
+            try:
+                subprocess.check_call(cmd)
+            except  subprocess.CalledProcessError:
+                pass
+            disks += ["--disk", "pool=%s,size=%s,bus=virtio" % (LVM_POOL_NAME, args.size)]
+        else:
+            disks += ["--disk", "vol=%s/%s,bus=virtio" % (LVM_POOL_NAME, name)]
+
+    # Assemble a virt-install commandline
+    cmd = ["virt-install", "-n", args.name, "-r", args.ram, "--vcpus", args.cpu]
+    cmd += disks
+    if args.uefi:
+        cmd += ["--boot", UEFI_FIRMWARE]
+    if args.pxe:
+        cmd += ["--pxe"]
+    elif args.iso:
+        cmd += ["--disk=path=%s,device=cdrom,shareable=on,readonly=on" % args.iso]
+    cmd += ["--network", "bridge=br0", "--rng", "/dev/random"]
+    cmd += ["--graphics", "vnc", "--video", "vga", "--noautoconsole"]
+    logging.debug(cmd)
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        logging.error("%s: %s" % (e, e.output))
+
+
+def setup_args():
+    """ Return argparse.Parser object of cmdline."""
+    parser = argparse.ArgumentParser(description="Run a virt")
+
+    parser.add_argument("-b", "--blank", action="store_true", default=False, help="Start with blank disks")
+    parser.add_argument("-n", "--disks", default=2, type=int, help="Number of disks to start with")
+    parser.add_argument("-s", "--size", default="10", help="Default size of disks in GiB")
+    parser.add_argument("-p", "--pxe", action="store_true", default=False, help="pxe boot")
+    parser.add_argument("-i", "--iso", help="iso to boot")
+    parser.add_argument("-r", "--ram", default="2048", help="Amount of RAM in Megabytes")
+    parser.add_argument("-c", "--cpu", default="2", help="Number of CPUs")
+    parser.add_argument("-u", "--uefi", action="store_true", default=False, help="Boot with UEFI OVMF firmware")
+    parser.add_argument("--ovmf-dir", help="Directory with OVMF firmware")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debugging output")
+    parser.add_argument("name", help="Name of virt")
+    args = parser.parse_args()
+
+    # Sanity check the args
+    if args.iso and args.pxe:
+        args.error("Cannot use --iso and --pxe at the same time.")
+    elif not args.iso and not args.pxe:
+        args.error("Need to pass one of --iso or --pxe")
+
+    return args
+
+
+def setup_logging():
+    if args.verbose:
+        level=logging.DEBUG
+    else:
+        level=logging.INFO
+    logging.basicConfig(format='%(levelname)s:%(message)s', level=level)
+
+if __name__=='__main__':
+    args = setup_args()
+    setup_logging()
+    main(args)
