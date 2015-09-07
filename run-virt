@@ -18,14 +18,16 @@
 #
 # Authors:      Brian C. Lane <bcl@redhat.com>
 #
+import os
 import subprocess
 import argparse
 import logging
 
 LVM_POOL_NAME="lvm_virt_pool"
 
-OVMF_DIR="/usr/share/edk2.git/ovmf-x64/"
-UEFI_FIRMWARE="loader=%(OMVF)s/OVMF-pure-efi.fd,loader_ro=yes,loader_type=pflash,nvram_template=%(OMVF)s/OVMF_VARS-pure-efi.fd" % {"OMVF": OVMF_DIR}
+#OVMF_DIR="/usr/share/edk2.git/ovmf-x64/"
+OVMF_DIR="/usr/share/OVMF/"
+UEFI_FIRMWARE="loader=%(OMVF)s/OVMF_CODE.fd,loader_ro=yes,loader_type=pflash,nvram_template=%(OMVF)s/OVMF_VARS.fd" % {"OMVF": OVMF_DIR}
 
 
 def main(args):
@@ -53,9 +55,9 @@ def main(args):
                 subprocess.check_call(cmd)
             except  subprocess.CalledProcessError:
                 pass
-            disks += ["--disk", "pool=%s,size=%s,bus=virtio" % (LVM_POOL_NAME, args.size)]
+            disks += ["--disk", "pool=%s,size=%s,bus=%s" % (LVM_POOL_NAME, args.size, args.bus)]
         else:
-            disks += ["--disk", "vol=%s/%s,bus=virtio" % (LVM_POOL_NAME, name)]
+            disks += ["--disk", "vol=%s/%s,bus=%s" % (LVM_POOL_NAME, name, args.bus)]
 
     # Assemble a virt-install commandline
     cmd = ["virt-install", "-n", args.name, "-r", args.ram, "--vcpus", args.cpu]
@@ -66,8 +68,31 @@ def main(args):
         cmd += ["--pxe"]
     elif args.iso:
         cmd += ["--disk=path=%s,device=cdrom,shareable=on,readonly=on" % args.iso]
+
+        # Try setting --os-variant
+        if "fedora" in args.iso.lower():
+            cmd += ["--os-variant=fedora21"]
+        elif "rhel6" in args.iso.lower():
+            cmd += ["--os-variant=rhel6.2"]
+        elif "rhel7" in args.iso.lower():
+            cmd += ["--os-variant=rhel7.0"]
+
+        # Inject the kickstart into the initrd
+        if args.kickstart:
+            cmd += ["--initrd-inject", args.kickstart]
+            cmd += ["--extra-args", "inst.ks=file:/%s inst.stage2=cdrom:/dev/sr0 %s" % (os.path.basename(args.kickstart), args.extra)]
+            cmd += ["--location", args.iso]
+
+    if args.cdrom:
+        cmd += ["--disk=path=%s,device=cdrom,shareable=on,readonly=on" % args.cdrom]
+
     cmd += ["--network", "bridge=br0", "--rng", "/dev/random"]
     cmd += ["--graphics", "vnc", "--video", "vga", "--noautoconsole"]
+
+    # Add more nics
+    for i in range(0, args.nics):
+        cmd += ["--network", "network=default,model=e1000"]
+
     logging.debug(cmd)
     try:
         subprocess.check_call(cmd)
@@ -80,14 +105,19 @@ def setup_args():
     parser = argparse.ArgumentParser(description="Run a virt")
 
     parser.add_argument("-b", "--blank", action="store_true", default=False, help="Start with blank disks")
+    parser.add_argument("--bus", default="virtio", help="bus type to use for disks. eg. virtio or scsi")
     parser.add_argument("-n", "--disks", default=2, type=int, help="Number of disks to start with")
     parser.add_argument("-s", "--size", default="10", help="Default size of disks in GiB")
     parser.add_argument("-p", "--pxe", action="store_true", default=False, help="pxe boot")
     parser.add_argument("-i", "--iso", help="iso to boot")
+    parser.add_argument("--cdrom", help="Additional cdrom iso image to attach")
+    parser.add_argument("-k", "--kickstart", help="kickstart to inject into initrd, requires an iso")
+    parser.add_argument("-e", "--extra", help="Add extra cmdline args for --kickstart boot", default="")
     parser.add_argument("-r", "--ram", default="2048", help="Amount of RAM in Megabytes")
     parser.add_argument("-c", "--cpu", default="2", help="Number of CPUs")
     parser.add_argument("-u", "--uefi", action="store_true", default=False, help="Boot with UEFI OVMF firmware")
     parser.add_argument("--ovmf-dir", help="Directory with OVMF firmware")
+    parser.add_argument("--nics", type=int, default=0, help="Number of extra nics to add")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debugging output")
     parser.add_argument("name", help="Name of virt")
     args = parser.parse_args()
@@ -97,6 +127,8 @@ def setup_args():
         args.error("Cannot use --iso and --pxe at the same time.")
     elif not args.iso and not args.pxe:
         args.error("Need to pass one of --iso or --pxe")
+    elif args.kickstart and not args.iso:
+        args.error("--kickstart needs an --iso so it can inject into the initrd")
 
     return args
 
