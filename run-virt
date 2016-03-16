@@ -19,79 +19,141 @@
 # Authors:      Brian C. Lane <bcl@redhat.com>
 #
 import os
+import sys
 import subprocess
 import argparse
 import logging
+import shutil
+import tempfile
+from pylorax.imgutils import mkcpio
+from pylorax.mount import IsoMountpoint
 
-LVM_POOL_NAME="lvm_virt_pool"
+MAPPER="/dev/mapper/"
+LVM_POOL_NAME="virt_pool"
 
 #OVMF_DIR="/usr/share/edk2.git/ovmf-x64/"
 OVMF_DIR="/usr/share/OVMF/"
 UEFI_FIRMWARE="loader=%(OMVF)s/OVMF_CODE.fd,loader_ro=yes,loader_type=pflash,nvram_template=%(OMVF)s/OVMF_VARS.fd" % {"OMVF": OVMF_DIR}
 
 
+def lvname(name):
+    """ Escape '-' in the LV name."""
+    return name.replace('-', '--')
+
+
+def lvpath(name):
+    """ Return the full path to the LV with escaped name."""
+    return(MAPPER+LVM_POOL_NAME+"-"+lvname(name))
+
+
+def append_initrd(initrd, files):
+    """ Append files to an initrd.
+
+    :param str initrd: Path to initrd
+    :param list files: list of file paths to add
+    :returns: Path to a new initrd
+    :rtype: str
+
+    The files are added to the initrd by creating a cpio image
+    of the files (stored at /) and writing the cpio to the end of a
+    copy of the initrd.
+
+    The initrd is not changed, a copy is made before appending the
+    cpio archive.
+    """
+    qemu_initrd = tempfile.mktemp(prefix="lmc-initrd-", suffix=".img")
+    shutil.copy2(initrd, qemu_initrd)
+    ks_dir = tempfile.mkdtemp(prefix="lmc-ksdir-")
+    for ks in files:
+        shutil.copy2(ks, ks_dir)
+    ks_initrd = tempfile.mktemp(prefix="lmc-ks-", suffix=".img")
+    mkcpio(ks_dir, ks_initrd)
+    shutil.rmtree(ks_dir)
+    with open(qemu_initrd, "ab") as initrd_fp:
+        with open(ks_initrd, "rb") as ks_fp:
+            while True:
+                data = ks_fp.read(1024**2)
+                if not data:
+                    break
+                initrd_fp.write(data)
+    os.unlink(ks_initrd)
+
+    return qemu_initrd
+
+
 def main(args):
     # Shut down any previous virt
-    try:
-        subprocess.check_call(["virsh", "destroy", args.name])
-    except subprocess.CalledProcessError:
-        pass
-    try:
-        subprocess.check_call(["virsh", "undefine", args.name])
-    except subprocess.CalledProcessError:
-        pass
+    # search process list for named qemu processes
 
     disks = []
     for n in range(0,args.disks):
         if n:
-            name = args.name + "-%d" % n
+            disk_name = args.name + "-%d" % n
         else:
-            name = args.name
+            disk_name = args.name
 
         if args.blank:
-            cmd = ["virsh", "vol-delete", "--pool", LVM_POOL_NAME, name]
+            cmd = ["lvremove", "--force", lvpath(disk_name)]
             logging.debug(cmd)
             try:
                 subprocess.check_call(cmd)
             except  subprocess.CalledProcessError:
                 pass
-            disks += ["--disk", "pool=%s,size=%s,bus=%s" % (LVM_POOL_NAME, args.size, args.bus)]
-        else:
-            disks += ["--disk", "vol=%s/%s,bus=%s" % (LVM_POOL_NAME, name, args.bus)]
 
-    # Assemble a virt-install commandline
-    cmd = ["virt-install", "-n", args.name, "-r", args.ram, "--vcpus", args.cpu]
+            cmd = ["lvcreate", "--size", args.size+"G", LVM_POOL_NAME, "-n", disk_name]
+            logging.debug(cmd)
+            try:
+                subprocess.check_call(cmd)
+            except  subprocess.CalledProcessError:
+                pass
+        else:
+            if not os.path.exists(lvpath(disk_name)):
+                logging.error("%s doesn't exist, rerun with --blank", lvpath(disk_name))
+                continue
+
+        disks += ["-drive", "file=%s,if=%s,cache=%s,format=raw" % (lvpath(disk_name), args.bus, args.disk_cache)]
+
+    # Assemble a qemu commandline
+    cmd = ["qemu-kvm", "-name", args.name, "-m", args.ram, "-smp", args.cpu]
     cmd += disks
     if args.uefi:
-        cmd += ["--boot", UEFI_FIRMWARE]
-    if args.pxe:
-        cmd += ["--pxe"]
-    elif args.iso:
-        cmd += ["--disk=path=%s,device=cdrom,shareable=on,readonly=on" % args.iso]
+        cmd += ["-drive", "file=%s/OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on" % OVMF_DIR]
+        cmd += ["-drive", "file=%s/OVMF_VARS.fd,if=pflash,format=raw,unit=1" % OVMF_DIR]
 
-        # Try setting --os-variant
-        if "fedora" in args.iso.lower():
-            cmd += ["--os-variant=fedora21"]
-        elif "rhel6" in args.iso.lower():
-            cmd += ["--os-variant=rhel6.2"]
-        elif "rhel7" in args.iso.lower():
-            cmd += ["--os-variant=rhel7.0"]
+    if args.pxe:
+        cmd += ["-boot", "n"]
+    elif args.iso:
+        cmd += ["-drive", "file=%s,media=cdrom,readonly=on" % args.iso]
 
         # Inject the kickstart into the initrd
         if args.kickstart:
-            cmd += ["--initrd-inject", args.kickstart]
-            cmd += ["--extra-args", "inst.ks=file:/%s inst.stage2=cdrom:/dev/sr0 %s" % (os.path.basename(args.kickstart), args.extra)]
-            cmd += ["--location", args.iso]
+            iso = IsoMountpoint(args.iso)
+            initrd = append_initrd(iso.initrd, [args.kickstart])
+            cmd += ["-kernel", iso.kernel]
+            cmd += ["-initrd", initrd]
+            cmd += ["-append", "inst.ks=file:/%s inst.stage2=cdrom:/dev/sr0 %s" % (os.path.basename(args.kickstart), args.extra)]
+        else:
+            cmd += ["-boot", "d"]
+    else:
+        logging.error("No boot method specified.")
+        sys.exit(1)
 
+    # Add extra cdroms
     if args.cdrom:
-        cmd += ["--disk=path=%s,device=cdrom,shareable=on,readonly=on" % args.cdrom]
+        for cdrom in args.cdrom:
+            cmd += ["-drive", "file=%s,media=cdrom,readonly=on" % cdrom]
 
-    cmd += ["--network", "bridge=br0", "--rng", "/dev/random"]
-    cmd += ["--graphics", "vnc", "--video", "vga", "--noautoconsole"]
+    cmd += ["-nodefconfig"]
+    cmd += ["-object", "rng-random,id=virtio-rng0,filename=/dev/random"]
+    cmd += ["-device", "virtio-rng-pci,rng=virtio-rng0,id=rng0,bus=pci.0,addr=0x9"]
+
+    # Just use default gtk display for now
+    cmd += ["-nographic", "-display", "gtk" ]
 
     # Add more nics
-    for i in range(0, args.nics):
-        cmd += ["--network", "network=default,model=e1000"]
+# TODO
+#    for i in range(0, args.nics):
+#        cmd += ["--network", "network=default,model=%s" % args.nic_model]
 
     logging.debug(cmd)
     try:
@@ -107,10 +169,11 @@ def setup_args():
     parser.add_argument("-b", "--blank", action="store_true", default=False, help="Start with blank disks")
     parser.add_argument("--bus", default="virtio", help="bus type to use for disks. eg. virtio or scsi")
     parser.add_argument("-n", "--disks", default=2, type=int, help="Number of disks to start with")
+    parser.add_argument("--disk-cache", default="writeback", choices=['none', 'writethrough', 'directsync', 'unsafe', 'writeback'], help="Disk cache type")
     parser.add_argument("-s", "--size", default="10", help="Default size of disks in GiB")
     parser.add_argument("-p", "--pxe", action="store_true", default=False, help="pxe boot")
     parser.add_argument("-i", "--iso", help="iso to boot")
-    parser.add_argument("--cdrom", help="Additional cdrom iso image to attach")
+    parser.add_argument("--cdrom", action="append", help="Additional cdrom iso image(s) to attach")
     parser.add_argument("-k", "--kickstart", help="kickstart to inject into initrd, requires an iso")
     parser.add_argument("-e", "--extra", help="Add extra cmdline args for --kickstart boot", default="")
     parser.add_argument("-r", "--ram", default="2048", help="Amount of RAM in Megabytes")
@@ -118,6 +181,7 @@ def setup_args():
     parser.add_argument("-u", "--uefi", action="store_true", default=False, help="Boot with UEFI OVMF firmware")
     parser.add_argument("--ovmf-dir", help="Directory with OVMF firmware")
     parser.add_argument("--nics", type=int, default=0, help="Number of extra nics to add")
+    parser.add_argument("--nic-model", default="virtio", choices=["virtio", "e1000", "rtl8139"], help="NIC model")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debugging output")
     parser.add_argument("name", help="Name of virt")
     args = parser.parse_args()
@@ -129,6 +193,11 @@ def setup_args():
         args.error("Need to pass one of --iso or --pxe")
     elif args.kickstart and not args.iso:
         args.error("--kickstart needs an --iso so it can inject into the initrd")
+
+    # Override cache default for virtio bus
+    if args.bus == "virtio":
+        if args.disk_cache not in ["none", "directsync"]:
+            args.disk_cache = "none"
 
     return args
 
