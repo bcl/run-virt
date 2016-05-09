@@ -113,25 +113,22 @@ def main(args):
                 logging.error("%s doesn't exist, rerun with --blank", lvpath(disk_name))
                 continue
 
-        disks += ["-drive", "file=%s,if=%s,cache=%s,format=raw" % (lvpath(disk_name), args.bus, args.disk_cache)]
+        if args.mpath:
+            disks += ["-drive", "file=%s,if=none,id=drive-scsi-disk%d,serial=mpath-drive,cache=%s,format=raw" % (lvpath(disk_name), n, args.disk_cache)]
+            disks += ["-device", "scsi-hd,physical_block_size=512,logical_block_size=512,drive=drive-scsi-disk%d,id=scsi-disk%d" % (n, n)]
+        else:
+            disks += ["-drive", "file=%s,if=%s,cache=%s,format=raw" % (lvpath(disk_name), args.bus, args.disk_cache)]
 
     # Assemble a qemu commandline
     cmd = ["qemu-kvm", "-name", args.name, "-m", args.ram, "-smp", args.cpu]
+    cmd += ["-device", "virtio-scsi-pci,id=scsidev"]
     cmd += disks
     if args.uefi:
         cmd += ["-drive", "file=%s/OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on" % OVMF_DIR]
         cmd += ["-drive", "file=%s/OVMF_VARS.fd,if=pflash,format=raw,unit=1" % OVMF_DIR]
 
     if args.pxe:
-        cmd += ["-boot", "n"]
-
-        # PXE needs bridged network to access PXE server on LAN
-        # Needs qemu-ifup script:
-        # http://www.linux-kvm.org/page/Networking#Public_Bridge
-        # Assumes host already had br0 setup
-        macaddr = "DE:AD:BE:EF:%02X:%02X" % (random.randint(0, 255), random.randint(0, 255))
-        cmd += ["-net", "nic,model=%s,macaddr=%s" % (args.nic_model, macaddr)]
-        cmd += ["-net", "tap,script=%s" % IFUP_SCRIPT]
+        cmd += ["-boot", "once=n"]
     elif args.iso:
         cmd += ["-drive", "file=%s,media=cdrom,readonly=on" % args.iso]
 
@@ -143,7 +140,11 @@ def main(args):
             cmd += ["-initrd", initrd]
             cmd += ["-append", "inst.ks=file:/%s inst.stage2=cdrom:/dev/sr0 %s" % (os.path.basename(args.kickstart), args.extra)]
         else:
-            cmd += ["-boot", "d"]
+            cmd += ["-boot", "once=d"]
+    elif args.disk:
+        if os.path.exists(args.disk):
+            cmd += ["-drive", "file=%s" % args.disk]
+        cmd += ["-boot", "c"]
     else:
         logging.error("No boot method specified.")
         sys.exit(1)
@@ -159,6 +160,14 @@ def main(args):
 
     # Just use default gtk display for now
     cmd += ["-nographic", "-display", "gtk" ]
+
+    # Use host's br0 and qemu's bridge setup helper script
+    # PXE needs bridged network to access PXE server on LAN
+    # http://wiki.qemu.org/Features/HelperNetworking#Setup
+    if args.pxe or args.bridge_nics:
+        macaddr = "DE:AD:BE:EF:%02X:%02X" % (random.randint(0, 255), random.randint(0, 255))
+        cmd += ["-net", "nic,model=%s,macaddr=%s" % (args.nic_model, macaddr)]
+        cmd += ["-net", "bridge"]
 
     # Add more nics
 # TODO
@@ -176,13 +185,16 @@ def setup_args():
     """ Return argparse.Parser object of cmdline."""
     parser = argparse.ArgumentParser(description="Run a virt")
 
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("-p", "--pxe", action="store_true", default=False, help="pxe boot")
+    action.add_argument("-i", "--iso", help="iso to boot")
+    action.add_argument("-d", "--disk", help="disk image to boot")
+
     parser.add_argument("-b", "--blank", action="store_true", default=False, help="Start with blank disks")
     parser.add_argument("--bus", default="virtio", help="bus type to use for disks. eg. virtio or scsi")
     parser.add_argument("-n", "--disks", default=2, type=int, help="Number of disks to start with")
     parser.add_argument("--disk-cache", default="writeback", choices=['none', 'writethrough', 'directsync', 'unsafe', 'writeback'], help="Disk cache type")
     parser.add_argument("-s", "--size", default="10", help="Default size of disks in GiB")
-    parser.add_argument("-p", "--pxe", action="store_true", default=False, help="pxe boot")
-    parser.add_argument("-i", "--iso", help="iso to boot")
     parser.add_argument("--cdrom", action="append", help="Additional cdrom iso image(s) to attach")
     parser.add_argument("-k", "--kickstart", help="kickstart to inject into initrd, requires an iso")
     parser.add_argument("-e", "--extra", help="Add extra cmdline args for --kickstart boot", default="")
@@ -190,18 +202,15 @@ def setup_args():
     parser.add_argument("-c", "--cpu", default="2", help="Number of CPUs")
     parser.add_argument("-u", "--uefi", action="store_true", default=False, help="Boot with UEFI OVMF firmware")
     parser.add_argument("--ovmf-dir", help="Directory with OVMF firmware")
+    parser.add_argument("--bridge-nics", action="store_true", default=False, help="Use br0 for nics. Requires host setup.")
     parser.add_argument("--nics", type=int, default=0, help="Number of extra nics to add")
     parser.add_argument("--nic-model", default="virtio", choices=["virtio", "e1000", "rtl8139"], help="NIC model")
+    parser.add_argument("--mpath", action="store_true", default=False, help="Make the disks mpath by using the same serial number")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debugging output")
     parser.add_argument("name", help="Name of virt")
     args = parser.parse_args()
 
-    # Sanity check the args
-    if args.iso and args.pxe:
-        args.error("Cannot use --iso and --pxe at the same time.")
-    elif not args.iso and not args.pxe:
-        args.error("Need to pass one of --iso or --pxe")
-    elif args.kickstart and not args.iso:
+    if args.kickstart and not args.iso:
         args.error("--kickstart needs an --iso so it can inject into the initrd")
 
     # Override cache default for virtio bus
