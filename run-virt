@@ -33,9 +33,8 @@ MAPPER="/dev/mapper/"
 LVM_POOL_NAME="virt_pool"
 IFUP_SCRIPT="/etc/qemu-ifup"
 
-#OVMF_DIR="/usr/share/edk2.git/ovmf-x64/"
-OVMF_DIR="/usr/share/OVMF/"
-UEFI_FIRMWARE="loader=%(OMVF)s/OVMF_CODE.fd,loader_ro=yes,loader_type=pflash,nvram_template=%(OMVF)s/OVMF_VARS.fd" % {"OMVF": OVMF_DIR}
+OVMF_DIR="/usr/share/edk2/ovmf/"
+#OVMF_DIR="/usr/share/OVMF/"
 
 
 def lvname(name):
@@ -125,7 +124,12 @@ def main(args):
     cmd += disks
     if args.uefi:
         cmd += ["-drive", "file=%s/OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on" % OVMF_DIR]
-        cmd += ["-drive", "file=%s/OVMF_VARS.fd,if=pflash,format=raw,unit=1" % OVMF_DIR]
+
+        # Make a copy of the OVMF_VARS.fd for this run
+        ovmf_vars = tempfile.mktemp(prefix="lmc-OVMF_VARS-", suffix=".fd")
+        shutil.copy2(OVMF_DIR+"/OVMF_VARS.fd", ovmf_vars)
+
+        cmd += ["-drive", "file=%s,if=pflash,format=raw,unit=1" % ovmf_vars]
 
     if args.pxe:
         cmd += ["-boot", "once=n"]
@@ -174,11 +178,18 @@ def main(args):
 #    for i in range(0, args.nics):
 #        cmd += ["--network", "network=default,model=%s" % args.nic_model]
 
+    if args.dry_run:
+        print(" ".join(cmd))
+        return
+
     logging.debug(cmd)
     try:
         subprocess.check_call(cmd)
     except subprocess.CalledProcessError as e:
         logging.error("%s: %s" % (e, e.output))
+    finally:
+        if args.uefi:
+            os.unlink(ovmf_vars)
 
 
 def setup_args():
@@ -206,6 +217,7 @@ def setup_args():
     parser.add_argument("--nics", type=int, default=0, help="Number of extra nics to add")
     parser.add_argument("--nic-model", default="virtio", choices=["virtio", "e1000", "rtl8139"], help="NIC model")
     parser.add_argument("--mpath", action="store_true", default=False, help="Make the disks mpath by using the same serial number")
+    parser.add_argument("--dry-run", action="store_true", default=False, help="Construct the commandline and print it instead of executing it")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debugging output")
     parser.add_argument("name", help="Name of virt")
     args = parser.parse_args()
