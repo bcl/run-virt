@@ -87,7 +87,11 @@ def main(args):
     # search process list for named qemu processes
 
     disks = []
-    for n in range(0,args.disks):
+    num_disks = args.disks
+    # Add a normal disk for mpath to boot from
+    if args.mpath:
+        num_disks += 1
+    for n in range(0,num_disks):
         if n:
             disk_name = args.name + "-%d" % n
         else:
@@ -112,11 +116,12 @@ def main(args):
                 logging.error("%s doesn't exist, rerun with --blank", lvpath(disk_name))
                 continue
 
-        if args.mpath:
+        if args.mpath and n > 0:
             disks += ["-drive", "file=%s,if=none,id=drive-scsi-disk%d,serial=mpath-drive,cache=%s,format=raw" % (lvpath(disk_name), n, args.disk_cache)]
-            disks += ["-device", "scsi-hd,physical_block_size=512,logical_block_size=512,drive=drive-scsi-disk%d,id=scsi-disk%d" % (n, n)]
+            disks += ["-device", "scsi-hd,physical_block_size=%s,logical_block_size=%s,drive=drive-scsi-disk%d,id=scsi-disk%d" % (args.block_size, args.block_size, n, n)]
         else:
             disks += ["-drive", "file=%s,if=%s,cache=%s,format=raw" % (lvpath(disk_name), args.bus, args.disk_cache)]
+
 
     # Assemble a qemu commandline
     cmd = ["qemu-kvm", "-name", args.name, "-m", args.ram, "-smp", args.cpu]
@@ -217,6 +222,7 @@ def setup_args():
     parser.add_argument("--nics", type=int, default=0, help="Number of extra nics to add")
     parser.add_argument("--nic-model", default="virtio", choices=["virtio", "e1000", "rtl8139"], help="NIC model")
     parser.add_argument("--mpath", action="store_true", default=False, help="Make the disks mpath by using the same serial number")
+    parser.add_argument("--block-size", default="512", help="Disk block size to use for mpath")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Construct the commandline and print it instead of executing it")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debugging output")
     parser.add_argument("name", help="Name of virt")
